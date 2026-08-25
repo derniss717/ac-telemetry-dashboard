@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AC 遥测仪表盘</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>AC 遥测仪表盘</h1>
+    <div class="session-info">
+      <span id="s-session" class="dim">—</span>
+      <span id="s-car">—</span>
+      <span id="s-track">—</span>
+      <span id="s-laps" class="dim"></span>
+      <span class="badge off" id="s-status">未连接</span>
+    </div>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden">
+  ⚠ 5 秒未收到 AC 数据 —— 请确认已开启 UDP 广播（运行 <code>python main.py doctor</code> 检查）
+</div>
+
+<section class="tiles">
+  <div class="tile big"><div class="label">车速 km/h</div><div class="value" id="t-speed">0</div></div>
+  <div class="tile"><div class="label">转速 rpm</div><div class="value" id="t-rpm">0</div></div>
+  <div class="tile"><div class="label">档位</div><div class="value" id="t-gear">N</div></div>
+  <div class="tile"><div class="label">当前圈</div><div class="value" id="t-curlap">--:--.---</div></div>
+  <div class="tile"><div class="label">上一圈</div><div class="value" id="t-lastlap">--:--.---</div></div>
+  <div class="tile"><div class="label">最佳圈</div><div class="value" id="t-bestlap">--:--.---</div></div>
+  <div class="tile"><div class="label">扇区</div><div class="value" id="t-sector">-</div></div>
+  <div class="tile"><div class="label">方向盘°</div><div class="value" id="t-steer">0</div></div>
+  <div class="tile"><div class="label">KERS 电量</div><div class="value" id="t-kers">--%</div></div>
+  <div class="tile"><div class="label">轮胎配方</div><div class="value" id="t-compound">--</div></div>
+  <div class="tile"><div class="label">油量</div><div class="value" id="t-fuel">--%</div></div>
+  <div class="tile gap-tile"><div class="label">最后圈 vs 最快圈</div><div class="value"><span id="t-gap">--:--.---</span></div></div>
+</section>
+
+<section class="charts">
+  <div class="card"><h2>车速 (km/h)</h2><canvas id="c-speed"></canvas></div>
+  <div class="card"><h2>转速 (rpm)</h2><canvas id="c-rpm"></canvas></div>
+  <div class="card"><h2>挡位</h2><canvas id="c-gear"></canvas></div>
+  <div class="card"><h2>油门 / 刹车 (%)</h2><canvas id="c-pedals"></canvas></div>
+  <div class="card"><h2>悬架行程 (mm)</h2><canvas id="c-susp"></canvas></div>
+  <div class="card"><h2>底板高度 (mm)</h2><canvas id="c-ride"></canvas></div>
+  <div class="card"><h2>电量 / 油量 (%)</h2><canvas id="c-kers"></canvas></div>
+  <div class="card"><h2>KERS 充放电 (kW) <span class="hint">正=放电 负=充电</span></h2><canvas id="c-kerskj"></canvas></div>
+  <div class="card"><h2>加速度 (m/s²)</h2><canvas id="c-accg"></canvas></div>
+  <div class="card"><h2>方向盘角度 °（左打红 / 右打绿）</h2><canvas id="c-steer"></canvas></div>
+  <div class="card"><h2>胎温 (°C)</h2><canvas id="c-tyre"></canvas></div>
+  <div class="card"><h2>外层胎温 (°C)</h2><canvas id="c-tyreO"></canvas></div>
+  <div class="card"><h2>滑移率 (%)</h2><canvas id="c-slip"></canvas></div>
+  <div class="card"><h2>胎压 (psi)</h2><canvas id="c-pressure"></canvas></div>
+  <div class="card"><h2>涡轮增压 (bar)</h2><canvas id="c-turbo"></canvas></div>
+</section>
+
+<section class="laps-panel">
+  <h2>本会话全部圈 <span class="hint" id="replay-hint"></span></h2>
+  <div id="laps-stats" class="laps-stats"></div>
+  <table id="laps-table">
+    <thead><tr>
+      <th>选</th><th>圈</th><th class="num">用时</th><th class="num">S1</th><th class="num">S2</th><th class="num">S3</th>
+      <th class="num">极速</th><th>状态</th><th>下载</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+  <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+    <button id="btn-compare" disabled>⛭ 对比选中的两圈</button>
+    <button id="btn-cleanup" style="margin-left:auto" title="永久删除旧会话数据，释放硬盘空间">🗑 清理旧会话</button>
+    <span class="hint" id="cmp-hint">勾选任意两圈（勾选框），对比秒差曲线</span>
+  </div>
+  <div class="chk">点击任意一行可回放该圈的遥测曲线；点「回到实时」恢复；「报告」下载该圈 HTML 单圈报告（图表直观）。</div>
+</section>
+
+<div id="cmp-panel" style="display:none">
+  <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+    <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">速度对比 km/h（快圈 <span style="color:#f85149">■</span> / 慢圈 <span style="color:#8b949e">■</span>）</h3>
+    <div class="cmp-box" style="height:220px;position:relative"><canvas id="c-cmp-speed" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  </div>
+  <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+    <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">油门对比 %（快圈 <span style="color:#f85149">■</span> / 慢圈 <span style="color:#8b949e">■</span>）</h3>
+    <div class="cmp-box" style="height:160px;position:relative"><canvas id="c-cmp-gas" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  </div>
+  <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+    <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">刹车对比 %（快圈 <span style="color:#f85149">■</span> / 慢圈 <span style="color:#8b949e">■</span>）</h3>
+    <div class="cmp-box" style="height:160px;position:relative"><canvas id="c-cmp-brake" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  </div>
+  <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+    <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">涡轮压力对比 bar（快圈 <span style="color:#f85149">■</span> / 慢圈 <span style="color:#8b949e">■</span>）</h3>
+    <div class="cmp-box" style="height:160px;position:relative"><canvas id="c-cmp-turbo" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  </div>
+  <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+    <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">ERS 放电功率对比 kW（快圈 <span style="color:#f85149">■</span> / 慢圈 <span style="color:#8b949e">■</span>）</h3>
+    <div class="cmp-box" style="height:160px;position:relative"><canvas id="c-cmp-ers" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  </div>
+  <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+    <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">纵向 G 对比（快圈 <span style="color:#f85149">■</span> / 慢圈 <span style="color:#8b949e">■</span>）</h3>
+    <div class="cmp-box" style="height:160px;position:relative"><canvas id="c-cmp-accx" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  </div>
+  <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+    <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">横向 G 对比（快圈 <span style="color:#f85149">■</span> / 慢圈 <span style="color:#8b949e">■</span>，正负对称）</h3>
+    <div class="cmp-box" style="height:160px;position:relative"><canvas id="c-cmp-acy" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  </div>
+  <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+    <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">方向盘角度 °（左打 <span style="color:#f85149">■</span> 右打 <span style="color:#2ea043">■</span>，快圈实线 / 慢圈虚线）</h3>
+    <div class="cmp-box" style="height:160px;position:relative"><canvas id="c-cmp-steer" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+  </div>
+    <div class="card" style="background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:10px">
+      <h3 style="font-size:13px;color:var(--dim);margin-bottom:8px">累计秒差（基准=快圈 0 线，正值=慢圈落后）</h3>
+      <div class="cmp-box" style="height:220px;position:relative"><canvas id="c-cmp-delta" style="position:absolute;left:0;top:0;width:100%;height:100%"></canvas></div>
+    </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

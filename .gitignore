@@ -1,0 +1,23 @@
+# ---- 数据（本地录制内容，勿上传）----
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# ---- PyInstaller 打包产物 ----
+dist-*/
+build-*/
+*.spec
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+
+# ---- 本地配置（含个人游戏路径等）----
+config.json
+
+# ---- 生成的报告与测试残留 ----
+reports/
+exe_check*.txt
+data_*/
+*.log
