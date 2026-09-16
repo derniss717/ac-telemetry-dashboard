@@ -104,6 +104,11 @@ tools/            开发期辅助脚本（轨迹对齐参数搜索、弯角数�
 - 每次启动为全新会话：程序打开时自动清空历史记录（想留着就先把 `data/` 拷走）
 - 容量：运行中自动保留最近 8 个会话，超限删最旧
 
+## 更新日志
+
+见 [CHANGELOG.md](CHANGELOG.md)（与程序内「点右上角版本号」看到的内容同源，
+由 `config.py` 的 `CHANGELOG` 生成，改了之后跑 `python tools/gen_changelog.py` 重新导出）。
+
 ## License
 
 MIT
