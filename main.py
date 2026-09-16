@@ -23,11 +23,20 @@ import time
 from pathlib import Path
 
 import config as cfg
-from ac_udp import UdpReceiver, bind_test
+from ac_udp import UdpReceiver, bind_test, RtTelemetryClient, _local_ip
 from dashboard import Dashboard
 from ring_buffer import RingBuffer
 from recorder import RecorderThread, SessionManager
 from storage import Storage
+
+
+def _ext_only(on_packet) -> callable:
+    """混合模式包装：UDP 广播里只转发扩展包（世界坐标/朝向/速度矢量），
+    其余包（physics/graphic/static）由共享内存负责，避免重复处理。"""
+    def _wrap(kind: str, fields: dict) -> None:
+        if kind == "extended":
+            on_packet(kind, fields)
+    return _wrap
 
 
 def _open_storage(args=None) -> Storage:
@@ -40,6 +49,9 @@ def _open_storage(args=None) -> Storage:
 # ---------------------------------------------------------------------------
 # start
 # ---------------------------------------------------------------------------
+_cleared_once = False   # 本次进程只清空一次：打开程序时清掉上次记录，进程内再次开始录制保留本次数据
+
+
 def run_server(port: int, http_port: int, source: str = "auto",
                duration: float = 0, stop_evt: threading.Event | None = None,
                no_browser: bool = False, on_ready=None) -> int:
@@ -48,12 +60,22 @@ def run_server(port: int, http_port: int, source: str = "auto",
     GUI 在线程中调用：传外部 stop_evt，停止时 set 即可；
     on_ready(http_port) 在服务启动成功后回调（GUI 可借此刷新状态）。
     """
+    global _cleared_once
     c = cfg.load_config()
     data_dir = cfg.resolve_path(c, "data_dir")
     data_dir.mkdir(parents=True, exist_ok=True)
     db = data_dir / "ac.db"
 
     storage = Storage(db)
+    import os as _os
+    _skip_reset = _os.environ.get("AC_SKIP_RESET") == "1"
+    if not _cleared_once and not _skip_reset:
+        # 每次打开程序全新会话：只清一次（清掉昨天/上次的记录），
+        # 进程内停止再开始录制不会再清，本次跑的数据保留
+        cleared = storage.reset_all_data()
+        _cleared_once = True
+        if cleared:
+            print(f"[main] 已清空历史数据（{cleared} 圈），本次为全新会话")
     ring = RingBuffer()
     mgr = SessionManager(storage, ring)
     if stop_evt is None:
@@ -76,6 +98,14 @@ def run_server(port: int, http_port: int, source: str = "auto",
                 reader = None
             else:
                 print("[main] 数据源: 共享内存（无需 UDP 广播）")
+                # 混合模式：RT 遥测客户端（游戏常驻监听 9996，握手订阅后回发
+                # RTCarInfo，含世界坐标/朝向/速度矢量——共享内存没有的位置数据）
+                try:
+                    ext_recv = RtTelemetryClient(port=port, on_packet=mgr.on_packet)
+                    ext_recv.start()
+                    print(f"[main] RT 遥测订阅: {_local_ip()}:{port}（世界坐标/朝向/速度矢量）")
+                except OSError as exc:
+                    print(f"[main] RT 遥测不可用: {exc}，世界坐标/朝向/速度矢量卡片将无数据")
     if reader is None:
         if source == "shared":
             print("[main] 共享内存不可用，请先启动游戏")
@@ -94,6 +124,7 @@ def run_server(port: int, http_port: int, source: str = "auto",
     try:
         rec_thread.start()
         dash.start()
+        dash.start_ws(ws_port=int(c.get("ws_port", 8081)))   # WebSocket 实时推送（前端优先通道）
     except OSError as exc:
         print(f"[main] 启动失败: {exc}")
         return 1
@@ -124,6 +155,7 @@ def run_server(port: int, http_port: int, source: str = "auto",
         rec_thread.join(timeout=5)
         recv.stop()
         dash.stop()
+        dash.stop_ws()   # 释放 8081，否则 GUI 停止→再开始时新 WS 起不来
         storage.close()
         print("[main] 录制已停止。赛后报告: python main.py analyze latest")
     return 0

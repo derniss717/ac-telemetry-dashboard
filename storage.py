@@ -7,6 +7,7 @@ frames.payload 为 float32 全通道 BLOB（顺序见 ac_udp.CHANNELS），
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -50,6 +51,9 @@ CREATE TABLE IF NOT EXISTS frames (
     rpms INT,
     lap_ms INT,
     sector INT,
+    pos_x REAL,
+    pos_y REAL,
+    pos_z REAL,
     payload BLOB
 );
 CREATE INDEX IF NOT EXISTS idx_frames_sess ON frames(session_id, id);
@@ -58,7 +62,7 @@ CREATE INDEX IF NOT EXISTS idx_frames_lap  ON frames(session_id, lap_id);
 
 _FRAME_INSERT = (
     "INSERT INTO frames (session_id, lap_id, t, dist, speed_kmh, gear, rpms,"
-    " lap_ms, sector, payload) VALUES (?,?,?,?,?,?,?,?,?,?)"
+    " lap_ms, sector, pos_x, pos_y, pos_z, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
 )
 
 
@@ -70,14 +74,28 @@ class Storage:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(SCHEMA)
-        # 旧库兼容：补缺的列（老库可能缺 tyre_compound/outlap，缺了会 SQL 报错 → 圈列表空/close 失败）
+        # 旧库兼容：补缺的列（老库可能缺 tyre_compound/outlap/pos_*，缺了会 SQL 报错）
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(laps)")}
         if "tyre_compound" not in cols:
             self.conn.execute("ALTER TABLE laps ADD COLUMN tyre_compound TEXT")
         if "outlap" not in cols:
             self.conn.execute("ALTER TABLE laps ADD COLUMN outlap INT DEFAULT 0")
+        fcols = {r[1] for r in self.conn.execute("PRAGMA table_info(frames)")}
+        for _c in ("pos_x", "pos_y", "pos_z"):
+            if _c not in fcols:
+                self.conn.execute(f"ALTER TABLE frames ADD COLUMN {_c} REAL")
         self.conn.commit()
         self._frame_stmt = self.conn.executemany  # 预编译见 insert_frames
+        # 读写分离（重构 #2）：写连接（self.conn）仅供录制线程，读连接（_rconn）供 HTTP
+        # 查询线程——WAL 模式下读不阻塞写，仪表盘查询不再排队等录制批量落库
+        self._rconn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._rconn.execute("PRAGMA busy_timeout=5000")
+        self._rlock = threading.Lock()
+
+    def _read(self, sql: str, args: tuple = ()):
+        """读查询走独立读连接（HTTP 线程高频调用，与录制写连接分离）。"""
+        with self._rlock:
+            return self._rconn.execute(sql, args)
 
     def close(self) -> None:
         try:
@@ -86,6 +104,10 @@ class Storage:
         except Exception:
             pass
         self.conn.close()
+        try:
+            self._rconn.close()
+        except Exception:
+            pass
 
     # ---------------- sessions ----------------
     def open_session(self, name: str, channels_json: str,
@@ -133,10 +155,31 @@ class Storage:
     def total_frame_count(self) -> int:
         # 用 id 跨度 (MAX-MIN+1) 近似行数：走主键索引 O(1)，避免周期性全表扫几十万行。
         # 删除旧会话（低 id）后 MIN 上移 → 跨度自然变小，不会像 MAX(id) 那样永远超限。
-        row = self.conn.execute("SELECT MAX(id), MIN(id) FROM frames").fetchone()
+        row = self._read("SELECT MAX(id), MIN(id) FROM frames").fetchone()
         if not row or row[0] is None:
             return 0
         return int(row[0] - row[1] + 1)
+
+    def reset_all_data(self) -> int:
+        """清空全部历史数据（程序每次启动调用：打开就是全新会话）。
+
+        删除所有会话/圈/帧并重置自增 id（会话编号从 1 开始），随后 VACUUM
+        物理瘦身（空库后文件回缩到 KB 级）。返回删除的圈数。
+        """
+        laps = int((self.conn.execute("SELECT COUNT(*) FROM laps").fetchone() or (0,))[0])
+        self.conn.execute("DELETE FROM frames")
+        self.conn.execute("DELETE FROM laps")
+        self.conn.execute("DELETE FROM sessions")
+        try:
+            self.conn.execute("DELETE FROM sqlite_sequence")
+        except sqlite3.OperationalError:
+            pass
+        self.conn.commit()
+        try:
+            self.conn.execute("VACUUM")
+        except sqlite3.OperationalError:
+            pass
+        return laps
 
     def auto_prune(self, keep_sessions: int = 8, max_frames: int = 400000) -> int:
         """帧数超上限时删除最旧会话（保留最近 keep_sessions 个），返回删除的帧数。
@@ -170,7 +213,7 @@ class Storage:
             pass
 
     def list_sessions(self) -> List[dict]:
-        rows = self.conn.execute(
+        rows = self._read(
             "SELECT id, name, start_ts, end_ts, car, track, best_lap_ms FROM sessions"
             " ORDER BY id"
         ).fetchall()
@@ -178,7 +221,7 @@ class Storage:
                 for r in rows]
 
     def get_session(self, session_id: int) -> Optional[dict]:
-        row = self.conn.execute(
+        row = self._read(
             "SELECT id, name, start_ts, end_ts, car, track, best_lap_ms, channels_json"
             " FROM sessions WHERE id=?", (session_id,)
         ).fetchone()
@@ -218,7 +261,7 @@ class Storage:
         self.conn.commit()
 
     def list_laps(self, session_id: int) -> List[dict]:
-        rows = self.conn.execute(
+        rows = self._read(
             "SELECT l.id, l.lap_no, l.start_frame, l.end_frame, l.total_ms, l.s1_ms,"
             " l.s2_ms, l.s3_ms, l.top_speed_kmh, l.is_valid, l.is_inlap, l.outlap, s.car"
             " FROM laps l JOIN sessions s ON s.id = l.session_id"
@@ -230,7 +273,7 @@ class Storage:
         return [dict(zip(cols, r)) for r in rows]
 
     def get_lap(self, lap_id: int) -> Optional[dict]:
-        row = self.conn.execute(
+        row = self._read(
             "SELECT id, session_id, lap_no, total_ms, s1_ms, s2_ms, s3_ms,"
             " top_speed_kmh, is_valid, is_inlap, outlap, tyre_compound"
             " FROM laps WHERE id=?",
@@ -242,29 +285,32 @@ class Storage:
 
     # ---------------- frames ----------------
     def insert_frames(self, rows: List[tuple]) -> None:
-        """rows: (session_id, lap_id, t, dist, speed_kmh, gear, rpms, lap_ms, sector, payload)"""
+        """rows: (session_id, lap_id, t, dist, speed_kmh, gear, rpms, lap_ms, sector,
+        pos_x, pos_y, pos_z, payload)——pos 为世界坐标（RT 遥测），无数据填 None"""
         if not rows:
             return
         self.conn.executemany(_FRAME_INSERT, rows)
         self.conn.commit()
 
     def frame_count(self, session_id: int) -> int:
-        row = self.conn.execute(
+        row = self._read(
             "SELECT COUNT(*) FROM frames WHERE session_id=?", (session_id,)).fetchone()
         return int(row[0]) if row else 0
 
     def frames_for_lap(self, session_id: int, lap_id: int) -> List[dict]:
         """取一圈的全部帧（含关键列 + payload 原样），按 id 升序。"""
-        rows = self.conn.execute(
-            "SELECT id, t, dist, speed_kmh, gear, rpms, lap_ms, sector, payload"
+        rows = self._read(
+            "SELECT id, t, dist, speed_kmh, gear, rpms, lap_ms, sector,"
+            " pos_x, pos_y, pos_z, payload"
             " FROM frames WHERE session_id=? AND lap_id=? ORDER BY id",
             (session_id, lap_id),
         ).fetchall()
-        cols = ["id", "t", "dist", "speed_kmh", "gear", "rpms", "lap_ms", "sector", "payload"]
+        cols = ["id", "t", "dist", "speed_kmh", "gear", "rpms", "lap_ms", "sector",
+                "pos_x", "pos_y", "pos_z", "payload"]
         return [dict(zip(cols, r)) for r in rows]
 
     def frames_by_session(self, session_id: int, limit: int = 2_000_000) -> List[dict]:
-        rows = self.conn.execute(
+        rows = self._read(
             "SELECT id, lap_id, t, dist, speed_kmh, gear, rpms, lap_ms, sector, payload"
             " FROM frames WHERE session_id=? ORDER BY id LIMIT ?",
             (session_id, limit),
@@ -273,6 +319,6 @@ class Storage:
         return [dict(zip(cols, r)) for r in rows]
 
     def max_frame_id(self, session_id: int) -> int:
-        row = self.conn.execute(
+        row = self._read(
             "SELECT MAX(id) FROM frames WHERE session_id=?", (session_id,)).fetchone()
         return int(row[0]) if row and row[0] else 0

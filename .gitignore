@@ -3,6 +3,7 @@ data/
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
 
 # ---- PyInstaller 打包产物 ----
 dist-*/
@@ -21,3 +22,20 @@ reports/
 exe_check*.txt
 data_*/
 *.log
+run_*.log
+
+# ---- 调试/临时残留，不入库 ----
+# UI 改版回滚备份
+backup_ui_v2/
+# 轨迹对齐调试截图
+tools/align_vis/
+# 轨迹图调试输出
+traj_*.png
+# 误留的嵌套仓库
+AC-telemetry/
+
+# ---- 前端依赖 ----
+# 体积大，clone 后 npm install 即可
+web-ui/node_modules/
+# 注意：web-ui/dist 是构建产物，但刻意入库——这样 clone 下来直接 python main.py
+# 就是新版界面，无需装 Node。改前端后记得 npm run build 并一并提交。

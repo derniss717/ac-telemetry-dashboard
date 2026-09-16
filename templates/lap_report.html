@@ -1,0 +1,137 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>单圈报告 · 圈 %(lap_no)s</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+:root { --bg:#0d1117; --panel:#161b22; --border:#2d333b; --text:#e6edf3; --dim:#8b949e; }
+* { box-sizing:border-box; margin:0; padding:0; }
+body { background:var(--bg); color:var(--text); font-family:"Segoe UI","Microsoft YaHei",sans-serif; padding:24px; max-width:1080px; margin:0 auto; }
+h1 { font-size:20px; margin-bottom:12px; }
+.meta { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:10px; margin-bottom:20px; }
+.meta div { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px; }
+.meta .k { font-size:11px; color:var(--dim); } .meta .v { font-size:18px; font-weight:700; }
+table { width:100%%; border-collapse:collapse; font-size:13px; margin-bottom:20px; }
+th,td { padding:6px 10px; text-align:left; border-bottom:1px solid var(--border); }
+th { color:var(--dim); font-weight:600; }
+td.num { text-align:right; font-variant-numeric:tabular-nums; }
+.grid { display:grid; grid-template-columns:1fr; gap:12px; }
+.card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px; }
+.card h3 { font-size:13px; color:var(--dim); margin-bottom:8px; }
+.chart-box { height:240px; position:relative; }
+.chart-box canvas { position:absolute; left:0; top:0; width:100%%; height:100%%; }
+</style></head><body>
+<h1 style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">🏁 单圈报告 · 圈 %(lap_no)s <span style="color:var(--dim);font-size:14px">%(car)s @ %(track)s</span></h1>
+<div class="meta">
+  <div><div class="k">圈时</div><div class="v">%(total)s</div></div>
+  <div><div class="k">S1 / S2 / S3</div><div class="v">%(s1)s / %(s2)s / %(s3)s</div></div>
+  <div><div class="k">极速</div><div class="v">%(top_speed)s km/h</div></div>
+  <div><div class="k">平均速度</div><div class="v">%(avg_speed)s km/h</div></div>
+  <div><div class="k">最大纵向G</div><div class="v">%(max_lon)s g</div></div>
+  <div><div class="k">最大横向G</div><div class="v">%(max_lat)s g</div></div>
+  <div><div class="k">耗油</div><div class="v">%(fuel_use)s L</div></div>
+  <div><div class="k">轮胎配方</div><div class="v">%(compound)s</div></div>
+  <div><div class="k">最大滑移率</div><div class="v">%(max_slip)s%%</div></div>
+  <div><div class="k">采样点数</div><div class="v">%(n_pts)s</div></div>
+</div>
+<h2 style="font-size:15px;margin-bottom:8px">📊 统计</h2>
+<table>
+<thead><tr><th>指标</th><th class="num">值</th></tr></thead><tbody>
+  <tr><td>最高转速</td><td class="num">%(max_rpm)s rpm</td></tr>
+  <tr><td>电量变化</td><td class="num">%(kers0)s%% → %(kers1)s%%</td></tr>
+  <tr><td>油量变化</td><td class="num">%(fuel0)s L → %(fuel1)s L</td></tr>
+  <tr><td>轮胎磨损</td><td class="num">%(wear_row)s</td></tr>
+%(gstat_rows)s
+</tbody></table>
+<h2 style="font-size:15px;margin-bottom:8px">🔄 弯角分析（横向G峰值 ≥ 1.2g）</h2>
+<table>
+<thead>%(corner_header)s</thead>
+<tbody>
+%(corners_html)s
+</tool_body></table>
+<div class="grid">
+<div class="card"><h3>车速 km/h（DRS 段红色）</h3><div class="chart-box"><canvas id="c-speed"></canvas></div></div>
+<div class="card"><h3>油门 %% / 刹车 %%</h3><div class="chart-box"><canvas id="c-pedals"></canvas></div></div>
+<div class="card"><h3>转速 rpm</h3><div class="chart-box"><canvas id="c-rpm"></canvas></div></div>
+<div class="card"><h3>挡位</h3><div class="chart-box"><canvas id="c-gear"></canvas></div></div>
+<div class="card"><h3>纵向 G / 横向 G</h3><div class="chart-box"><canvas id="c-acc"></canvas></div></div>
+<div class="card"><h3>转向角度 °</h3><div class="chart-box"><canvas id="c-steer"></canvas></div></div>
+<div class="card"><h3>悬架行程 mm（FL/FR/RL/RR）</h3><div class="chart-box"><canvas id="c-susp"></canvas></div></div>
+<div class="card"><h3>底板高度 mm（前/后）</h3><div class="chart-box"><canvas id="c-ride"></canvas></div></div>
+<div class="card"><h3>电量 %% / 油量 L</h3><div class="chart-box"><canvas id="c-kers"></canvas></div></div>
+<div class="card"><h3>涡轮压力 bar</h3><div class="chart-box"><canvas id="c-turbo"></canvas></div></div>
+<div class="card"><h3>胎温 °C（FL/FR/RL/RR）</h3><div class="chart-box"><canvas id="c-tyre"></canvas></div></div>
+<div class="card"><h3>滑移率 %%（FL/FR/RL/RR）</h3><div class="chart-box"><canvas id="c-slip"></canvas></div></div>
+<div class="card"><h3>轮胎磨损 %%（FL/FR/RL/RR）</h3><div class="chart-box"><canvas id="c-wear"></canvas></div></div></div>
+<script>
+const D = %(json_data)s;
+const X = D.frames.map(f => (f.d > 0 ? (f.d - D.frames[0].d) / 1000 : f.t));
+const drs = D.frames.map(f => f.drs);
+const GRID = { color:"rgba(139,148,158,0.15)" };
+const TICK = "#8b949e";
+function mk(id, datasets, extraY) {
+  // 横轴按赛道实际长度自适应：数据最大距离向上取整到 0.1km，避免刻度取整后轴延伸到 5km 造成右侧空白
+  const xMax = Math.ceil(Math.max(...X) * 10) / 10 || 1;
+  const scales = {
+    x: { type:"linear", min:0, max:xMax, ticks: { color:TICK, maxTicksLimit:6, callback:v => v>=1 ? v.toFixed(1)+"km" : Math.round(v*1000)+"m" },
+          grid: GRID, title: { display:true, text:"圈内距离", color:TICK, font:{size:10} } },
+    y: { ticks: { color:TICK }, grid: GRID }
+  };
+  Object.assign(scales, extraY||{});
+  return new Chart(document.getElementById(id), {
+    type: "line", data: { labels: X, datasets },
+    options: { animation:false, responsive:true, maintainAspectRatio:false, scales,
+      interaction: { mode:"index", intersect:false },
+      plugins: { legend: { labels: { color:"#e6edf3", boxWidth:10, font:{size:10} } } } }
+  });
+}
+function get(f, key) {
+  const parts = key.split(".");
+  let v = f;
+  for (const p of parts) v = v ? v[p] : undefined;
+  return v;
+}
+function smooth(arr, win) {
+  if (!win || win <= 1 || !arr || arr.length <= win) return arr;
+  const half = Math.floor(win / 2), out = [];
+  for (let i = 0; i < arr.length; i++) {
+    let sum = 0, n = 0;
+    for (let j = Math.max(0, i - half); j <= Math.min(arr.length - 1, i + half); j++) {
+      const v = arr[j];
+      if (v != null && !isNaN(v)) { sum += v; n++; }
+    }
+    out.push(n ? sum / n : null);
+  }
+  return out;
+}
+function s(name, color, key, extra, win) {
+  const ds = { label:name, borderColor:color, backgroundColor:color, data: smooth(D.frames.map(f => get(f, key)), win || 0),
+    borderWidth:1.5, pointRadius:0, tension:0.15, spanGaps:true };
+  Object.assign(ds, extra||{});
+  return ds;
+}
+const SPEED_CFG = { segment: { borderColor: ctx => {
+  const i = ctx.p0DataIndex != null ? ctx.p0DataIndex : ctx.p0.dataIndex;
+  return (drs[i]||0) > 0.5 ? "#f85149" : "#58a6ff";
+} } };
+mk("c-speed", [s("车速 km/h", "#58a6ff", "v", SPEED_CFG, 3)]);
+mk("c-pedals", [s("油门 %%", "#2ea043", "gas", null, 3), s("刹车 %%", "#f85149", "brk", null, 3)]);
+mk("c-rpm", [s("转速 rpm", "#d2a8ff", "rpm", null, 3)]);
+mk("c-gear", [s("挡位", "#e3b341", "gear", null, 1)]);   // 档位不平滑（阶梯数据）
+mk("c-acc", [s("纵向 G", "#58a6ff", "accX", null, 5), s("横向 G", "#f0883e", "accY", null, 5)]);
+mk("c-steer", [s("转向 °", "#3fb950", "steer", null, 5)]);
+mk("c-susp", ["FL","FR","RL","RR"].map((w,i) => s("悬架 "+w+" mm", ["#58a6ff","#f0883e","#3fb950","#da3633"][i], "susp." + i, null, 5)));
+mk("c-ride", [s("底板 前 mm", "#f0f6fc", "ride.0", null, 5), s("底板 后 mm", "#f0883e", "ride.1", null, 5)]);
+mk("c-kers", [s("电量 %%", "#7ee787", "kers", null, 3), s("油量 L", "#e3b341", "fuel", null, 5)]);
+mk("c-turbo", [s("涡轮 bar", "#d2a8ff", "turbo", null, 3)]);
+mk("c-tyre", ["FL","FR","RL","RR"].map((w,i) => s("胎温 "+w+" °C", ["#58a6ff","#f0883e","#3fb950","#da3633"][i], "tyre." + i, null, 5)));
+mk("c-slip", ["FL","FR","RL","RR"].map((w,i) => s("滑移率 "+w+" %%", ["#58a6ff","#f0883e","#3fb950","#da3633"][i], "slip." + i, null, 3)));
+// 轮胎磨损曲线：磨损变化极小（~99%%），Y 轴跟随数据范围放大显示
+(function(){
+  const wa = [];
+  for (const f of D.frames) if (f.wear) for (const v of f.wear) if (v != null && !isNaN(v)) wa.push(v);
+  let lo = 0, hi = 100;
+  if (wa.length) { lo = Math.min.apply(null, wa); hi = Math.max.apply(null, wa); }
+  const pad = (hi - lo) || 2;
+  mk("c-wear", ["FL","FR","RL","RR"].map((w,i) => s("磨损 "+w+" %%", ["#58a6ff","#f0883e","#3fb950","#da3633"][i], "wear." + i, null, 1)),
+    { y: { ticks: { color: TICK }, grid: GRID, min: Math.max(0, lo - pad * 0.3), max: hi + pad * 0.3 } });
+})();
+</script></body></html>

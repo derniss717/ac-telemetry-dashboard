@@ -1,6 +1,10 @@
 /* AC 遥测仪表盘前端逻辑：200ms 轮询 /api/live，增量维护各图表数据。 */
 "use strict";
 
+// Chart.js 缩放插件：只在卡片放大态启用（滚轮缩放 x 轴 + 拖拽平移）
+const _zoomPlugin = window["chartjs-plugin-zoom"];
+if (typeof Chart !== "undefined" && _zoomPlugin) Chart.register(_zoomPlugin);
+
 const POLL_MS = 200;
 const LAPS_POLL_MS = 2000;
 const SESSION_POLL_MS = 5000;
@@ -40,6 +44,7 @@ const repos = {
   pressure: makeRepo(),
   turbo: makeRepo(),
   tyreO: makeRepo(), slip: makeRepo(),
+  brakeT: makeRepo(), wear: makeRepo(),
   steer: makeRepo(),
 };
 
@@ -74,7 +79,7 @@ function ingestFrame(fr) {
   const x = (fr.dist != null && lapDistBase != null) ? (fr.dist - lapDistBase) : fr.lap_ms;
   pushFrame(repos.speed, x, { speed: fr.speed, drs: fr.drs > 0.5 ? 1 : 0 });
   pushFrame(repos.rpm, x, { rpm: fr.rpms });
-  pushFrame(repos.gear, x, { gear: fr.gear - 1 });   // AC: gear=档位+1（1=空挡, 9=8档）
+  pushFrame(repos.gear, x, { gear: fr.gear - 1 });   // AC 偏移编码：2=1档→1，9=8档→8
   pushFrame(repos.pedals, x, { gas: fr.gas * 100, brake: fr.brake * 100 });
   // 单位换算：悬架/底板 米→mm；电量 0~1→%；油量是"升"（如 46.5L），按会话最大油量归一化为 %；
   // G 值保留原值(g)
@@ -98,7 +103,37 @@ function ingestFrame(fr) {
   pushFrame(repos.turbo, x, { turbo: fr.turbo });
   if (fr.tyreO) pushFrame(repos.tyreO, x, { FL: fr.tyreO[0], FR: fr.tyreO[1], RL: fr.tyreO[2], RR: fr.tyreO[3] });
   if (fr.slip) pushFrame(repos.slip, x, { FL: fr.slip[0] * 100, FR: fr.slip[1] * 100, RL: fr.slip[2] * 100, RR: fr.slip[3] * 100 });   // AC 滑移率 0~1 → %
+  if (fr.brakeT) pushFrame(repos.brakeT, x, { FL: fr.brakeT[0], FR: fr.brakeT[1], RL: fr.brakeT[2], RR: fr.brakeT[3] });
+  if (fr.wear) pushFrame(repos.wear, x, { FL: fr.wear[0], FR: fr.wear[1], RL: fr.wear[2], RR: fr.wear[3] });   // tyreWear 0~100（%），基础字段可靠
+  checkExtData(fr);   // 扩展数据（外层胎温/刹车盘温/磨损）有效性自检，齐全才显示对应卡片
   if (fr.steer != null) pushFrame(repos.steer, x, { steer: fr.steer });   // 方向盘角度 °（左负右正）
+}
+
+/* ---------------- 扩展数据自检测 ----------------
+   AC 的 668 字节扩展布局（刹车盘温/胎温三层/磨损）在部分车型上偏移不对，
+   会读出垃圾值（如 442°C、848°C、10°C）。这里做范围校验：
+   只有当 4 轮数据全部落在合理范围内，才显示对应卡片；否则一直隐藏。
+   一旦某类数据被确认有效（车型数据布局正确），保持显示（跨圈不重置）。 */
+const extOk = { tyreO: false, brakeT: false, wear: false };
+function _inRange(v, lo, hi) {
+  return v != null && !isNaN(v) && v >= lo && v <= hi;
+}
+function _all4Ok(arr, lo, hi) {
+  return Array.isArray(arr) && arr.length >= 4 && arr.slice(0, 4).every(v => _inRange(v, lo, hi));
+}
+function checkExtData(fr) {
+  if (!extOk.tyreO && _all4Ok(fr.tyreO, 20, 200)) extOk.tyreO = true;    // 外层胎温 °C（排除 0/442 垃圾）
+  if (!extOk.brakeT && _all4Ok(fr.brakeT, 50, 900)) extOk.brakeT = true; // 刹车盘温 °C（排除 0/10 垃圾）
+  if (!extOk.wear && _all4Ok(fr.wear, 0, 100)) extOk.wear = true;        // 磨损 0~100%（基础字段，可靠）
+  applyExtVisibility();
+}
+function applyExtVisibility() {
+  const map = { tyreO: "c-tyreO", brakeT: "c-brakeT", wear: "c-wear" };
+  for (const k of Object.keys(map)) {
+    const cv = document.getElementById(map[k]);
+    const card = cv ? cv.closest(".card") : null;
+    if (card) card.style.display = extOk[k] ? "" : "none";
+  }
 }
 
 /* ---------------- 降采样（渲染用，stride） ---------------- */
@@ -134,6 +169,11 @@ function baseOptions(unit, secondAxis) {
             return v == null || isNaN(v) ? "" : `距离 ${fmtDist(v)}`;
           },
         },
+      },
+      // 滚轮缩放/拖拽平移：默认禁用，仅在卡片放大态（.zoom）由点击逻辑启用
+      zoom: {
+        zoom: { wheel: { enabled: false }, pinch: { enabled: false }, mode: "x" },
+        pan: { enabled: false, mode: "x" },
       },
     },
   };
@@ -194,6 +234,10 @@ const charts = {
     line(`胎温 ${w} °C`, CHART_COLORS.tyre[i], w)), baseOptions("°C")),
   tyreO: mkChart("c-tyreO", WHEELS.map((w, i) =>
     line(`外层胎温 ${w} °C`, CHART_COLORS.tyre[i], w)), baseOptions("°C")),
+  brakeT: mkChart("c-brakeT", WHEELS.map((w, i) =>
+    line(`刹车盘温 ${w} °C`, CHART_COLORS.tyre[i], w)), baseOptions("°C")),
+  wear: mkChart("c-wear", WHEELS.map((w, i) =>
+    line(`磨损 ${w} %`, CHART_COLORS.tyre[i], w)), baseOptions("%")),
   slip: mkChart("c-slip", WHEELS.map((w, i) =>
     line(`滑移率 ${w} %`, CHART_COLORS.tyre[i], w)), baseOptions("%")),
   pressure: mkChart("c-pressure", WHEELS.map((w, i) =>
@@ -217,7 +261,7 @@ const charts = {
    fixed = 固定范围不做自适应 */
 charts.speed._auto = { mode: "pad", zero: true };
 charts.rpm._auto = { mode: "pad", zero: true };
-charts.gear._auto = { mode: "fixed", min: 1, max: 8 };   // 只显示 1~8 档
+charts.gear._auto = { mode: "fixed", min: 1, max: 8 };   // 只显示 1~8 档（数据已 -1 换算）
 charts.gear._smooth = 1;   // 阶梯数据不平滑（避免出现 4.333 档）
 charts.kerskj._auto = { mode: "pad", zero: true };   // 跟随数据自适应（0 线保留，不再固定对称浪费空间）
 // KERS 充放电 tooltip：正=放电 / 负=充电，直接标注，方便区分
@@ -237,6 +281,8 @@ charts.accg._auto = { mode: "fixed", min: -6, max: 6 };  // 纵向 F1 极限范�
 charts.accg._auto1 = { mode: "sym", padAbs: 0.5 };       // 横向独立右轴，自适应（弯道 ~2g 也能看清）
 charts.tyre._auto = { mode: "pad" };
 charts.tyreO._auto = { mode: "pad" };
+charts.brakeT._auto = { mode: "pad", loCap: 0 };
+charts.wear._auto = { mode: "pad" };   // 磨损跟随数据自适应（值集中在 ~99%，固定 0~100 会挤在顶部看不清变化）
 charts.slip._auto = { mode: "pad", zero: true };   // 滑移率从 0 起
 charts.turbo._auto = { mode: "pad", loCap: 0 };
 charts.steer._auto = { mode: "pad" };   // 方向盘角度跟随数据自适应
@@ -248,15 +294,52 @@ document.querySelectorAll(".card").forEach(card => {
   card.addEventListener("click", () => {
     const zoomed = card.classList.toggle("zoom");
     const h = card.querySelector("h2, h3");
-    if (!h) return;
-    if (zoomed && !card.dataset.origTitle) {
-      card.dataset.origTitle = h.textContent;
-      h.textContent = h.textContent.replace(/（.*?）/g, "") + "（点击卡片还原）";
-    } else if (!zoomed && card.dataset.origTitle) {
-      h.textContent = card.dataset.origTitle;
+    if (h) {
+      if (zoomed && !card.dataset.origTitle) {
+        card.dataset.origTitle = h.textContent;
+        h.textContent = h.textContent.replace(/（.*?）/g, "") + "（点击卡片还原）";
+      } else if (!zoomed && card.dataset.origTitle) {
+        h.textContent = card.dataset.origTitle;
+      }
+    }
+    // 放大态启用滚轮缩放 x 轴 + 拖拽平移；还原时禁用并复位到全范围
+    const canvas = card.querySelector("canvas");
+    if (canvas) {
+      const ch = findChartByCanvas(canvas);
+      if (ch && ch.options.plugins && ch.options.plugins.zoom) {
+        ch.options.plugins.zoom.zoom.wheel.enabled = zoomed;
+        ch.options.plugins.zoom.zoom.pinch.enabled = zoomed;
+        ch.options.plugins.zoom.pan.enabled = zoomed;
+        if (zoomed) {
+          // 限制缩小：把 x 轴范围锁在"点击放大时的窗口"内（limits.min/max 轴值 clamp），
+          // 滚轮缩小（范围变大）或平移都不会超出该窗口 —— 最小维持打开时的大小
+          const sx = ch.scales.x;
+          if (sx && sx.min != null && sx.max != null && sx.max > sx.min) {
+            ch.options.plugins.zoom.limits = { x: { min: sx.min, max: sx.max } };
+          }
+          if (ch.resetZoom) ch.resetZoom();
+        } else {
+          delete ch.options.plugins.zoom.limits;
+          if (ch.resetZoom) ch.resetZoom();
+        }
+        ch.update("none");
+      }
     }
   });
 });
+
+/* 根据 canvas 找到对应的 chart 实例（主图表 + 对比图） */
+function findChartByCanvas(canvas) {
+  for (const k of Object.keys(charts)) {
+    if (charts[k] && charts[k].canvas === canvas) return charts[k];
+  }
+  if (typeof cmpCharts !== "undefined") {
+    for (const k of Object.keys(cmpCharts)) {
+      if (cmpCharts[k] && cmpCharts[k].canvas === canvas) return cmpCharts[k];
+    }
+  }
+  return null;
+}
 charts.speed._smooth = 3;
 
 /* 胎压 Y 轴按车型动态调整：已知车型用实测固定范围（稳），未知车型回退数据自适应 */
@@ -354,6 +437,7 @@ function refreshChart(name) {
 /* ---------------- 数值块 ---------------- */
 function fmtMs(ms) {
   if (ms == null || isNaN(ms) || ms <= 0) return "--:--.---";
+  ms = Math.round(ms);   // 取整到毫秒，避免平均圈速（浮点）出现超长小数
   const m = Math.floor(ms / 60000), s = Math.floor((ms % 60000) / 1000), f = ms % 1000;
   return `${m}:${String(s).padStart(2, "0")}.${String(f).padStart(3, "0")}`;
 }
@@ -364,7 +448,8 @@ function fmtDist(m) {
   return `${(m / 1000).toFixed(1)}km`;
 }
 function gearText(g) {
-  if (g == null) return "N";
+  // AC 共享内存 gear 偏移编码（官方：0=R, 1=N, 2=1档, 9=8档）
+  if (g == null) return "-";
   if (g <= 0) return "R";
   if (g === 1) return "N";
   return String(g - 1);
@@ -584,17 +669,29 @@ async function cleanupSessions() {
 /* ---------------- 圈回放：点击最近圈行查看该圈遥测 ---------------- */
 let replayMode = false;
 let replayLapNo = null;
+// 圈数据内存缓存（最近 3 圈）：同一圈重复点击不再请求后端，秒开。
+// 每圈 JSON 十几 MB，缓存上限 3 圈（约 50-100MB）防止内存膨胀。
+const lapCache = new Map();
+const LAP_CACHE_MAX = 3;
 
 async function loadLap(lap) {
   try {
-    // 帧是批量落库的：刚完成的圈圈记录已入库但帧可能还在缓冲区，
-    // 自动重试最多 3 次（每次等 1s）等帧写库，避免误报"无数据"
-    let data = null;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const r = await fetch(`/api/lap/${lap.id}`);
-      data = await r.json();
-      if (data.frames && data.frames.length > 0) break;
-      if (attempt < 3) await new Promise(res => setTimeout(res, 1000));
+    let data = lapCache.get(lap.id);
+    if (data) {
+      lapCache.delete(lap.id); lapCache.set(lap.id, data);   // LRU 刷新
+    } else {
+      // 帧是批量落库的：刚完成的圈圈记录已入库但帧可能还在缓冲区，
+      // 自动重试最多 3 次（每次等 1s）等帧写库，避免误报"无数据"
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const r = await fetch(`/api/lap/${lap.id}`);
+        data = await r.json();
+        if (data.frames && data.frames.length > 0) break;
+        if (attempt < 3) await new Promise(res => setTimeout(res, 1000));
+      }
+      if (data.frames && data.frames.length > 0) {
+        lapCache.set(lap.id, data);
+        if (lapCache.size > LAP_CACHE_MAX) lapCache.delete(lapCache.keys().next().value);
+      }
     }
     if (!data.frames || data.frames.length === 0) {
       alert("该圈还没有数据（帧可能还在写入，稍后再试）");
@@ -800,7 +897,14 @@ function renderCompare(pts, fast, slow) {
   const base = {
     animation: false, responsive: true, maintainAspectRatio: false,
     interaction: { mode: "index", intersect: false },
-    plugins: { legend: { labels: { color: "#e6edf3", boxWidth: 10, font: { size: 10 } } } },
+    plugins: {
+      legend: { labels: { color: "#e6edf3", boxWidth: 10, font: { size: 10 } } },
+      // 滚轮缩放/拖拽平移：默认禁用，仅在卡片放大态由点击逻辑启用
+      zoom: {
+        zoom: { wheel: { enabled: false }, pinch: { enabled: false }, mode: "x" },
+        pan: { enabled: false, mode: "x" },
+      },
+    },
     scales: {
       x: { type: "linear", min: 0, max: X[X.length - 1] || 1,
            ticks: { color: TICK, maxTicksLimit: 6, callback: v => v >= 1 ? v.toFixed(1) + "km" : Math.round(v * 1000) + "m" },

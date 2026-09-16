@@ -9,10 +9,40 @@ from pathlib import Path
 
 APP_NAME = "ac-telemetry"
 
-APP_VERSION = "1.1"   # 程序版本号：GUI 右上角显示；发新版前改这里再重新打包
+APP_VERSION = "2.0"   # 程序版本号：GUI 右上角显示；发新版前改这里再重新打包
 
 # 更新日志（GUI 点版本号查看；新版本发布时在顶部插入新条目）
 CHANGELOG: dict = {
+    "v2.0": [
+        "[新增] 前端重构为 Vue3 + Vite 现代化架构（替代 1.2 单文件 app.js）",
+        "[新增] WebSocket 实时推送（替代 200ms HTTP 轮询，数据刷新丝滑无延迟）",
+        "[新增] 移动端适配（响应式布局，手机浏览器可直接访问仪表盘）",
+        "[新增] 图表鼠标悬停十字线联动（MoTeC 风格：鼠标在任意卡片滑动，顶部数字条实时显示该位置数据）",
+        "[新增] 共享内存直读模式（无需 UDP 广播配置，游戏启动即可连接）",
+        "[新增] RT 遥测订阅（世界坐标/朝向/速度矢量，为赛道轨迹图准备）",
+        "[新增] SQLite 读写分离（录制写入不阻塞仪表盘查询，高频数据刷新不再卡顿）",
+        "[优化] 数据库采用 WAL 模式 + busy_timeout（写入不再排队阻塞读查询）",
+        "[优化] 帧数据批量裁剪（摊还 O(1)，200Hz 高频写入下 CPU 占用大幅降低）",
+        "[优化] 图表渲染：rAF 节流 + 轻量重绘（不再每次鼠标移动全量更新图表）",
+        "[优化] 双界面统一：双击 bat 直接使用新版界面（8080 同时服务 HTTP + 前端）",
+        "[修复] DRS 红线染色功能失效（v2.0 迁移后数据源引用错误，DRS 区间不再标红）",
+        "[修复] WebSocket 缺失模块时线程裸崩溃（现在优雅降级回 HTTP 轮询）",
+        "[修复] WS 服务无法停止（GUI 停止→再开始端口占用报错）",
+        "[修复] 点击图例切换曲线显隐误触卡片放大",
+        "[修复] hover 时上一圈/最佳圈/轮胎配方显示 “--”（改为保留实时值）",
+    ],
+    "v1.2": [
+        "[新增] 图表放大后滚轮缩放 + 拖拽平移",
+        "[新增] 报告轮胎磨损曲线图",
+        "[新增] 刹车盘温、轮胎磨损数据卡片",
+        "[新增] 报告弯角表刹车到开油时间",
+        "[新增] 赞德沃特赛道弯角数据",
+        "[新增] 每次启动程序为全新会话，自动清空历史记录",
+        "[修复] 蒙扎赛道弯角数据：官方命名、补漏弯角",
+        "[修复] 报告标题与信息对齐",
+        "[修复] 胎温/刹车盘温/磨损数据自检测：数据可靠才显示",
+        "[优化] 回放速度大幅提升，同圈重复查看秒开",
+    ],
     "v1.1": [
         "修复：全新环境下数据表缺列导致跑圈不记录、看不到圈数的问题",
         "新增：右上角版本号显示 + 点击查看更新日志",
@@ -31,6 +61,7 @@ CHANGELOG: dict = {
 DEFAULT_CONFIG = {
     "udp_port": 9996,          # AC 广播端口（udp.ini 中 PORT 需一致）
     "http_port": 8080,         # 实时仪表盘端口
+    "ws_port": 8081,           # WebSocket 实时推送端口（前端优先通道）
     "data_dir": "data",        # 会话数据库目录
     "reports_dir": "reports",  # 报告输出目录
     "session_name": "",        # 留空则自动用时间命名
@@ -170,21 +201,35 @@ def write_udp_ini(path: Path, port: int) -> None:
         except Exception:
             raw = ""
     if "[UDP]" in raw:
-        # 逐行替换 UDP 段内的三个键
+        # 原位重写整个 [UDP] 段（跳过原段所有行，其他段保持不动），保证段头只出现一次
         lines = raw.splitlines()
         in_udp = False
         out = []
         for ln in lines:
             stripped = ln.strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
+            is_section = stripped.startswith("[") and stripped.endswith("]")
+            if is_section:
+                if in_udp:
+                    # 原 UDP 段结束（遇到下一个段头）：补写重写后的 UDP 段
+                    out.append("[UDP]")
+                    out.append("ENABLED=1")
+                    out.append("IP=127.0.0.1")
+                    out.append(f"PORT={port}")
+                    in_udp = False
                 in_udp = stripped.lower() == "[udp]"
-            if in_udp and stripped.lower().startswith(("enabled=", "ip=", "port=")):
-                continue  # 稍后统一重写
-            out.append(ln)
-        out.append("[UDP]")
-        out.append(f"ENABLED=1")
-        out.append(f"IP=127.0.0.1")
-        out.append(f"PORT={port}")
+                if in_udp:
+                    continue  # 跳过原 UDP 段头（稍后重写）
+                out.append(ln)
+            elif in_udp:
+                continue  # 跳过原 UDP 段内的键
+            else:
+                out.append(ln)
+        if in_udp:
+            # 原文件以 UDP 段结尾：段尾补写
+            out.append("[UDP]")
+            out.append("ENABLED=1")
+            out.append("IP=127.0.0.1")
+            out.append(f"PORT={port}")
         path.write_text("\n".join(out) + "\n", encoding="utf-8")
     else:
         path.write_text(UDP_INI_TEMPLATE.format(port=port), encoding="utf-8")
@@ -224,4 +269,13 @@ def ensure_ac_ini_dev_apps() -> Path | None:
             for line in raw.splitlines():
                 if line.strip().lower().startswith("enable_dev_apps="):
                     return ac_ini if line.split("=", 1)[1].strip() != "1" else None
+    return None
+
+
+def find_ac_tracks_dir() -> Path | None:
+    """AC 安装目录 content/tracks（赛道 ui 图/ai 文件所在）。找不到返回 None。"""
+    for cand in _ac_install_candidates():
+        p = cand / "content" / "tracks"
+        if p.is_dir():
+            return p
     return None

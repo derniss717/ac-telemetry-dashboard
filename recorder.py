@@ -45,6 +45,7 @@ class SessionManager:
         self.tyre_compound = ""    # 轮胎配方（graphic 字段，如 Supersoft/Hard；UDP 模式拿不到）
         self.last_packet_t = 0.0
         self.laps_done = 0
+        self._last_ext: Optional[Dict] = None   # 最近一帧 UDP 扩展包（世界坐标/朝向/速度矢量），共享内存模式由混合监听填充
 
     # ---------------- 包入口（接收线程） ----------------
     def on_packet(self, kind: str, fields: Dict) -> None:
@@ -59,6 +60,9 @@ class SessionManager:
             self._on_graphic(fields)
         elif kind == "physics":
             self._on_physics(fields)
+        elif kind == "extended":
+            # UDP 扩展包（含世界坐标/朝向/速度矢量）：缓存最新值，供后续 physics 帧携带
+            self._last_ext = fields
 
     def _on_static(self, f: Dict) -> None:
         car = f.get("carModel") or ""
@@ -70,6 +74,13 @@ class SessionManager:
                 self.storage.update_session_info(self.session_id, car, track)
 
     def _ensure_session(self) -> None:
+        if self.session_id is not None:
+            # 健壮性：会话行可能被外部删除（reset_all_data / 清理旧会话），
+            # 此时写帧/圈会变成孤儿数据（sessions 无行但 laps/frames 有）。
+            # 检测到则重建会话，避免数据不可见。
+            if self.storage.get_session(self.session_id) is None:
+                print(f"[recorder] 会话 #{self.session_id} 已不存在（可能被清理），重建新会话")
+                self.session_id = None
         if self.session_id is None:
             self.session_name = f"AC_{time.strftime('%Y%m%d_%H%M%S')}"
             self.session_id = self.storage.open_session(
@@ -123,6 +134,12 @@ class SessionManager:
             "dist": self._last_dist,
             "channels": ac_udp.channel_array(f),
         }
+        # UDP 扩展数据（世界坐标/朝向/速度矢量）：与 physics 帧合并，实时卡片用；回放帧无此列
+        ext = self._last_ext
+        if ext:
+            frame["pos"] = list(ext.get("worldPosition") or ())
+            frame["orient"] = list(ext.get("orientation") or ())
+            frame["vel"] = list(ext.get("velocity") or ())
         self.ring.push(frame)
 
     # ---------------- 圈 ---------------- 
@@ -234,8 +251,10 @@ class RecorderThread(threading.Thread):
                 if sid is None or fr.get("lap_id") is None:
                     continue
                 payload = np.asarray(fr["channels"], dtype=np.float32).tobytes()
+                p = fr.get("pos") or (None, None, None)
                 rows.append((sid, fr["lap_id"], fr["t"], fr["dist"], fr["speed_kmh"],
-                             fr["gear"], fr["rpms"], fr["lap_ms"], fr["sector"], payload))
+                             fr["gear"], fr["rpms"], fr["lap_ms"], fr["sector"],
+                             p[0], p[1], p[2], payload))
             if rows:
                 try:
                     self.storage.insert_frames(rows)

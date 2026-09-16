@@ -1,1 +1,9 @@
+# 必需
 numpy>=1.24
+# WebSocket 实时推送（缺失时前端自动回退 HTTP 轮询，仍可用）
+websockets>=12
+
+# 可选：赛后分析报告（python main.py analyze，生成 plotly 报告）
+# plotly>=5.18
+# 可选：赛道轨迹对齐（trackalign.py 与 tools/ 下的对齐脚本）
+# scipy>=1.10

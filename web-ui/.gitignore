@@ -1,0 +1,5 @@
+# 依赖包（不提交）
+node_modules/
+
+# 构建产物
+web-ui/dist/

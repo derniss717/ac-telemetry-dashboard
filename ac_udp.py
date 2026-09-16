@@ -13,6 +13,7 @@ brakeTemp / 胎温 I/M/O / ERS 等级 / kersCurrentKJ 等）采用社区通用�
 """
 from __future__ import annotations
 
+import math
 import socket
 import struct
 import threading
@@ -213,8 +214,29 @@ def parse_static(data: bytes) -> Dict[str, object]:
     return _read_fields(data, STATIC_FIELDS)
 
 
+# ---------------------------------------------------------------------------
+# SPacketExtended：AC 官方 UDP 扩展包（remote telemetry），52 字节 = 13 个 float32
+#   speedKmh         float     偏移  0   车速 km/h
+#   worldPosition    float[3]  偏移  4   世界坐标 x/y/z
+#   orientation      float[2][3] 偏移 16  朝向（forward/right 各 3 分量，实测校准）
+#   velocity         float[3]  偏移 40   速度矢量 x/y/z (m/s)
+# 共享内存没有这些字段，只有 UDP 广播会发（部分客户端需握手请求，按包长分派兜底）。
+# ---------------------------------------------------------------------------
+EXTENDED_SIZE = 52
+EXTENDED_FIELDS: list[tuple] = [
+    ("speedKmh", "f", 1, 0),
+    ("worldPosition", "f", 3, 4),
+    ("orientation", "f", 6, 16),
+    ("velocity", "f", 3, 40),
+]
+
+
+def parse_extended(data: bytes) -> Dict[str, object]:
+    return _read_fields(data, EXTENDED_FIELDS)
+
+
 def parse_packet(data: bytes) -> Tuple[str, Dict[str, object]]:
-    """按包长分派。返回 (kind, fields)，kind ∈ physics/graphic/static/unknown。"""
+    """按包长分派。返回 (kind, fields)，kind ∈ physics/graphic/static/extended/unknown。"""
     n = len(data)
     if n == GRAPHIC_SIZE:
         return "graphic", parse_graphic(data)
@@ -222,6 +244,8 @@ def parse_packet(data: bytes) -> Tuple[str, Dict[str, object]]:
         return "physics", parse_physics(data)
     if STATIC_SIZE - 60 <= n <= 640:  # 不同 AC 版本 static 长度略有差异
         return "static", parse_static(data)
+    if n == EXTENDED_SIZE:
+        return "extended", parse_extended(data)
     return "unknown", {}
 
 
@@ -308,13 +332,28 @@ def validate_physics(fields: Dict[str, object]) -> list[str]:
 # ---------------------------------------------------------------------------
 # UDP 接收
 # ---------------------------------------------------------------------------
+def _local_ip() -> str:
+    """本机局域网 IP（AC 广播目标用网卡 IP 而非 127.0.0.1——Windows 10 的
+    localhost UDP 问题：游戏绑 0.0.0.0:9996 接收时，发往 127.0.0.1 的包会被
+    游戏自己的 socket 吞掉，外部程序收不到；发往网卡 IP 则可正常接收）。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))   # 不实际发包，仅让系统选路由
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except Exception:
+        return "127.0.0.1"
+
+
 class UdpReceiver:
     """绑定本地端口接收 AC UDP 广播，回调 (kind, fields)。"""
 
-    def __init__(self, port: int = 9996, host: str = "127.0.0.1",
+    def __init__(self, port: int = 9996, host: str | None = None,
                  on_packet: Callable[[str, Dict[str, object]], None] = None):
         self.port = port
-        self.host = host
+        self.host = host or _local_ip()   # 默认绑本机网卡 IP（见 _local_ip 注释）
         self.on_packet = on_packet
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
@@ -381,3 +420,153 @@ def bind_test(port: int, host: str = "127.0.0.1", timeout: float = 1.0) -> Tuple
         return False, f"端口 {port} 绑定失败: {exc}（可能已被其他程序占用）"
     finally:
         s.close()
+
+
+# ---------------------------------------------------------------------------
+# AC Remote Telemetry (RT) 协议：游戏常驻监听 9996，需客户端主动握手+订阅
+#   客户端 → AC: 12B <3i> (identifier, version, operation)
+#   AC → 客户端: op=0 后发握手响应 408/808B；op=1 后持续推 RTCarInfo 328B
+#   RTCarInfo 尾部带世界坐标 carCoordinates X/Y/Z（共享内存没有的 pos 来源）
+# 参考：OnTrack(Chrixco) / rickwest ac-remote-telemetry-client 已验证布局。
+# ---------------------------------------------------------------------------
+RT_OP_HANDSHAKE = 0
+RT_OP_SUBSCRIBE_UPDATE = 1
+RT_OP_DISMISS = 3
+RT_HANDSHAKE_FMT = "<3i"
+RT_CAR_INFO_FMT = "<4si3f6b2x3f4i5fif" + "4f" * 14 + "2f3f"
+RT_CAR_INFO_SIZE = struct.calcsize(RT_CAR_INFO_FMT)  # 328
+RT_RESP_SIZES = (408, 808)
+
+
+def build_rt_packet(operation: int) -> bytes:
+    """构造 12 字节 RT 握手/订阅包。"""
+    return struct.pack(RT_HANDSHAKE_FMT, 0, 1, operation)
+
+
+def parse_rt_car_info(data: bytes) -> Dict[str, object] | None:
+    """解析 328B RTCarInfo → 字段 dict；非法包返回 None。"""
+    if len(data) != RT_CAR_INFO_SIZE:
+        return None
+    v = struct.unpack(RT_CAR_INFO_FMT, data)
+    if not v[0] or v[0][0:1] != b"a":
+        return None
+    return {
+        "speedKmh": v[2],
+        "accG": (v[13], v[12], v[11]),          # 纵, 横, 垂（对齐前端 accG 顺序）
+        "lapTime": v[14], "lastLap": v[15], "bestLap": v[16], "lapCount": v[17],
+        "gas": v[18], "brake": v[19], "clutch": v[20],
+        "rpms": v[21], "steer": v[22], "gear": v[23], "cgHeight": v[24],
+        "posNormalized": v[81], "slope": v[82],
+        "worldPosition": (v[83], v[84], v[85]),  # 世界坐标 X/Y/Z
+    }
+
+
+class RtTelemetryClient:
+    """AC 远程遥测客户端：握手 → 订阅 → 收 RTCarInfo（328B，~100Hz）。
+
+    与游戏 UDP 广播不同，RT 协议无需 udp.ini 配置（游戏常驻监听 9996），
+    客户端绑独立端口（不抢 9996），主动握手订阅后游戏回发数据。
+    数据经 on_packet("extended", ...) 回调（worldPosition + 差分 orientation/velocity），
+    供 recorder 并入实时帧。断线自动重连（超时重发握手）。
+    """
+
+    def __init__(self, port: int = 9996,
+                 on_packet: Callable[[str, Dict[str, object]], None] = None):
+        self.port = port
+        self.on_packet = on_packet
+        self._sock: Optional[socket.socket] = None
+        self._stop = threading.Event()
+        self._last_pos: Optional[tuple] = None
+        self._last_t = 0.0
+
+    def start(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("0.0.0.0", 0))          # 客户端用随机端口，不抢游戏的 9996
+        self._sock.settimeout(0.5)
+        target = _local_ip()
+        self._target = (target, self.port)
+        self._thread = threading.Thread(target=self._loop, name="rt-client", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._sock.sendto(build_rt_packet(RT_OP_DISMISS), self._target)
+        except Exception:
+            pass
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+
+    def _loop(self) -> None:
+        state = "handshake"     # handshake → subscribed
+        last_attempt = 0.0
+        last_data = time.time()
+        while not self._stop.is_set():
+            now = time.time()
+            # 握手/订阅（首次或响应超时 5s 重来）
+            if state == "handshake":
+                if now - last_attempt > 1.0:
+                    try:
+                        self._sock.sendto(build_rt_packet(RT_OP_HANDSHAKE), self._target)
+                    except OSError:
+                        pass
+                    last_attempt = now
+                try:
+                    data, _addr = self._sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if len(data) in RT_RESP_SIZES:
+                    try:
+                        self._sock.sendto(build_rt_packet(RT_OP_SUBSCRIBE_UPDATE), self._target)
+                    except OSError:
+                        pass
+                    state = "subscribed"
+                    last_data = time.time()
+                continue
+            # 已订阅：收 RTCarInfo
+            try:
+                data, _addr = self._sock.recvfrom(2048)
+            except socket.timeout:
+                if time.time() - last_data > 5.0:
+                    state = "handshake"     # 数据断流，重新握手订阅
+                continue
+            except OSError:
+                break
+            last_data = time.time()
+            fields = parse_rt_car_info(data)
+            if not fields:
+                continue
+            pos = fields["worldPosition"]
+            # 坐标差分：推出朝向（yaw）与速度矢量（m/s）。
+            # 注意：now 要在收包后取（循环开头取的 now 可能和上一帧相同，
+            # dt≈0 会被阈值跳过，导致差分永远不输出）
+            now = time.time()
+            orient, vel = None, None
+            if self._last_pos is not None:
+                dt = now - self._last_t
+                if dt > 0.001:
+                    dx = pos[0] - self._last_pos[0]
+                    dy = pos[1] - self._last_pos[1]
+                    dz = pos[2] - self._last_pos[2]
+                    yaw = math.atan2(dz, dx) if (dx or dz) else 0.0
+                    orient = (math.cos(yaw), math.sin(yaw), 0.0,
+                              -math.sin(yaw), math.cos(yaw), 0.0)  # forward + right
+                    vel = (dx / dt, dy / dt, dz / dt)
+            self._last_pos = pos
+            self._last_t = now
+            if self.on_packet:
+                try:
+                    self.on_packet("extended", {
+                        "speedKmh": fields["speedKmh"],
+                        "worldPosition": pos,
+                        "orientation": orient,
+                        "velocity": vel,
+                    })
+                except Exception:
+                    pass
